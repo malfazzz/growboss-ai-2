@@ -21,3 +21,10 @@ A deployable Flask prototype with email/password accounts, per-account cloud-sid
 ## Important launch checklist
 
 This is an **MVP**, not an audited production service. Before accepting real customer data or payments: add email verification, password reset, rate limits and bot protections, robust CSRF protection, HTTPS-only deployment, monitoring, backups, legal pages (privacy policy and terms), data export/deletion workflows, and a managed database. Restrict registration until those are done. Avoid collecting sensitive customer data. Billing is not activated by the checkout redirect alone; verified Stripe webhooks update subscription status. Free AI quota defaults to 3/month; paid quota to 200/month. Chat history remains browser-session-local, while business records are stored server-side. The app uses a single workspace per account and is not yet multi-user/team-enabled.
+
+
+## AI Image Studio (added)
+
+AI Image Studio supports text-to-image and editing a user-uploaded PNG/JPEG/WebP photo via OpenAI Images API. The existing `OPENAI_API_KEY` environment variable is reused. Default `OPENAI_IMAGE_MODEL=gpt-image-1-mini` (requires access to the model on your OpenAI project). Optional environment variables: `FREE_IMAGE_LIMIT=0`, `PAID_IMAGE_LIMIT=10`. Limits reset at the beginning of each UTC calendar month, not at Stripe renewal. The image quota counts attempted requests, including API failures, to protect against cost overruns. Images are returned to the browser and not saved to the server; customers must download them. The backend accepts uploads up to 8.5 MB.
+
+**Production warning:** Do not accept paying customers until you have persistent database storage, verified Stripe configuration and webhook handling, email verification, password reset, rate limiting, abuse moderation, security review, and a billing/usage policy. Free Render instances have ephemeral SQLite storage, so quotas and accounts can reset on redeploy. AI image generation may require OpenAI organization verification.
