@@ -11,7 +11,7 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', S
 DB=os.environ.get('DATABASE_PATH',str(ROOT/'growboss.sqlite3'))
 FREE_AI_LIMIT=int(os.environ.get('FREE_AI_LIMIT','3'))
 PAID_AI_LIMIT=int(os.environ.get('PAID_AI_LIMIT','200'))
-FREE_IMAGE_LIMIT=int(os.environ.get('FREE_IMAGE_LIMIT','0'))
+FREE_IMAGE_LIMIT=int(os.environ.get('FREE_IMAGE_LIMIT','3'))
 PAID_IMAGE_LIMIT=int(os.environ.get('PAID_IMAGE_LIMIT','10'))
 
 def conn():
