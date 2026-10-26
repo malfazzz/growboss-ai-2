@@ -1,41 +1,42 @@
-import os, json, sqlite3, secrets, hashlib, hmac, time, urllib.request, urllib.error
+import os, json, sqlite3, secrets, time, urllib.request, urllib.error
+from pathlib import Path
+from functools import wraps
 import psycopg
 from psycopg.rows import dict_row
-from pathlib import Path
 from flask import Flask, request, jsonify, send_from_directory, session
 from werkzeug.security import generate_password_hash, check_password_hash
-from functools import wraps
 
 ROOT=Path(__file__).resolve().parent
 app=Flask(__name__,static_folder=None)
-app.secret_key=os.environ.get('SECRET_KEY', secrets.token_hex(32))
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE','1')=='1', MAX_CONTENT_LENGTH=12000000)
+app.secret_key=os.environ.get('SECRET_KEY',secrets.token_hex(32))
+app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE','1')=='1',MAX_CONTENT_LENGTH=12000000)
 DB=os.environ.get('DATABASE_PATH',str(ROOT/'growboss.sqlite3'))
 FREE_AI_LIMIT=int(os.environ.get('FREE_AI_LIMIT','3'))
 PAID_AI_LIMIT=int(os.environ.get('PAID_AI_LIMIT','200'))
-FREE_IMAGE_LIMIT=int(os.environ.get('FREE_IMAGE_LIMIT','3'))
-PAID_IMAGE_LIMIT=int(os.environ.get('PAID_IMAGE_LIMIT','10'))
+FREE_IMAGE_LIMIT=int(os.environ.get('FREE_IMAGE_LIMIT','0'))
+PAID_IMAGE_LIMIT=int(os.environ.get('PAID_IMAGE_LIMIT','20'))
+PRO_PLUS_AI_LIMIT=int(os.environ.get('PRO_PLUS_AI_LIMIT','1000'))
+PRO_PLUS_IMAGE_LIMIT=int(os.environ.get('PRO_PLUS_IMAGE_LIMIT','70'))
+ACTIVE=('active','trialing')
 
 class DatabaseConnection:
  def __init__(self):
   self.postgres=bool(os.environ.get('DATABASE_URL'))
-  if self.postgres:
-   self.db=psycopg.connect(os.environ['DATABASE_URL'],row_factory=dict_row,connect_timeout=15)
+  if self.postgres:self.db=psycopg.connect(os.environ['DATABASE_URL'],row_factory=dict_row,connect_timeout=15)
   else:
    self.db=sqlite3.connect(DB,timeout=15)
    self.db.row_factory=sqlite3.Row
  def __enter__(self):return self
- def __exit__(self,exc_type,exc,tb):
+ def __exit__(self,typ,exc,tb):
   try:
-   if exc_type:self.db.rollback()
+   if typ:self.db.rollback()
    else:self.db.commit()
   finally:self.db.close()
  def execute(self,sql,params=()):
   if self.postgres:
    if sql=='BEGIN IMMEDIATE':sql='SELECT 1'
-   sql=sql.replace('?', '%s')
+   sql=sql.replace('?','%s')
   return self.db.execute(sql,params)
-
 def conn():return DatabaseConnection()
 
 def init():
@@ -51,6 +52,13 @@ def init():
    c.execute('CREATE TABLE IF NOT EXISTS ai_usage (user_id INTEGER, month TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(user_id,month))')
    c.execute('CREATE TABLE IF NOT EXISTS image_usage (user_id INTEGER, month TEXT, count INTEGER DEFAULT 0, PRIMARY KEY(user_id,month))')
   c.execute('CREATE TABLE IF NOT EXISTS webhook_events (id TEXT PRIMARY KEY)')
+  # Additive migration: existing customers and subscriptions remain intact.
+  if c.postgres:c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'free'")
+  else:
+   columns=[r['name'] for r in c.execute('PRAGMA table_info(users)').fetchall()]
+   if 'plan' not in columns:c.execute("ALTER TABLE users ADD COLUMN plan TEXT DEFAULT 'free'")
+  # Previous paid accounts are Pro until Stripe subscription events identify their price.
+  c.execute("UPDATE users SET plan='pro' WHERE subscription IN ('active','trialing') AND (plan IS NULL OR plan='free')")
 init()
 
 def require_auth(fn):
@@ -63,7 +71,17 @@ def require_auth(fn):
 def user():
  with conn() as c:return c.execute('SELECT * FROM users WHERE id=?',(session['uid'],)).fetchone()
 
-def public_user(u):return {'email':u['email'],'plan':u['subscription'],'active':u['subscription'] in ('active','trialing'),'ai_limit':PAID_AI_LIMIT if u['subscription'] in ('active','trialing') else FREE_AI_LIMIT}
+def effective_plan(u):
+ if u['subscription'] not in ACTIVE:return 'free'
+ return u['plan'] if u['plan'] in ('pro','pro_plus') else 'pro'
+
+def limits(u):
+ p=effective_plan(u)
+ return ((PRO_PLUS_AI_LIMIT,PRO_PLUS_IMAGE_LIMIT) if p=='pro_plus' else (PAID_AI_LIMIT,PAID_IMAGE_LIMIT) if p=='pro' else (FREE_AI_LIMIT,FREE_IMAGE_LIMIT))
+
+def public_user(u):
+ a,i=limits(u)
+ return {'email':u['email'],'plan':effective_plan(u),'active':u['subscription'] in ACTIVE,'ai_limit':a,'image_limit':i,'subscription_status':u['subscription']}
 
 @app.before_request
 def security():
@@ -80,8 +98,8 @@ def register():
  if len(email)>254 or '@' not in email or len(pw)<10 or len(pw)>128:return jsonify(error='Enter a valid email and a password of at least 10 characters.'),400
  try:
   with conn() as c:
-   cur=c.execute('INSERT INTO users(email,password,created) VALUES(?,?,?) RETURNING id',(email,generate_password_hash(pw),int(time.time())));uid=cur.fetchone()['id']
- except (sqlite3.IntegrityError, psycopg.errors.UniqueViolation):return jsonify(error='An account with this email already exists.'),409
+   uid=c.execute('INSERT INTO users(email,password,created) VALUES(?,?,?) RETURNING id',(email,generate_password_hash(pw),int(time.time()))).fetchone()['id']
+ except (sqlite3.IntegrityError,psycopg.errors.UniqueViolation):return jsonify(error='An account with this email already exists.'),409
  session.clear();session['uid']=uid
  return jsonify(user=public_user(user()))
 
@@ -126,7 +144,7 @@ def chat():
   clean.append({'role':m['role'],'content':m['content'][:4000]})
  key=os.environ.get('OPENAI_API_KEY')
  if not key:return jsonify(error='AI is not configured on the server yet.'),503
- u=user();month=time.strftime('%Y-%m',time.gmtime());limit=PAID_AI_LIMIT if u['subscription'] in ('active','trialing') else FREE_AI_LIMIT
+ u=user();month=time.strftime('%Y-%m',time.gmtime());limit=limits(u)[0]
  with conn() as c:
   c.execute('BEGIN IMMEDIATE')
   if c.postgres:c.execute('SELECT pg_advisory_xact_lock(?)',(int(u['id']),))
@@ -141,19 +159,17 @@ def chat():
   return jsonify(reply=out['choices'][0]['message']['content'])
  except Exception:return jsonify(error='AI service unavailable. Try again later.'),502
 
-
 @app.get('/api/images/usage')
 @require_auth
 def image_usage():
- u=user();month=time.strftime('%Y-%m',time.gmtime());limit=PAID_IMAGE_LIMIT if u['subscription'] in ('active','trialing') else FREE_IMAGE_LIMIT
- with conn() as c:
-  r=c.execute('SELECT count FROM image_usage WHERE user_id=? AND month=?',(u['id'],month)).fetchone()
+ u=user();month=time.strftime('%Y-%m',time.gmtime());limit=limits(u)[1]
+ with conn() as c:r=c.execute('SELECT count FROM image_usage WHERE user_id=? AND month=?',(u['id'],month)).fetchone()
  return jsonify(used=r['count'] if r else 0,limit=limit,month=month)
 
 @app.post('/api/images/generate')
 @require_auth
 def image_generate():
- import base64, uuid
+ import base64,uuid
  key=os.environ.get('OPENAI_API_KEY')
  if not key:return jsonify(error='OpenAI API key is not configured.'),503
  prompt=str(request.form.get('prompt','')).strip()
@@ -165,7 +181,7 @@ def image_generate():
   mime=upload.mimetype
   if mime not in ('image/png','image/jpeg','image/webp') or not raw.startswith((b'\x89PNG\r\n\x1a\n',b'\xff\xd8\xff',b'RIFF')):return jsonify(error='Upload a PNG, JPEG, or WebP image.'),400
  else:raw=None;mime=None
- u=user();month=time.strftime('%Y-%m',time.gmtime());limit=PAID_IMAGE_LIMIT if u['subscription'] in ('active','trialing') else FREE_IMAGE_LIMIT
+ u=user();month=time.strftime('%Y-%m',time.gmtime());limit=limits(u)[1]
  with conn() as c:
   c.execute('BEGIN IMMEDIATE')
   if c.postgres:c.execute('SELECT pg_advisory_xact_lock(?)',(int(u['id']),))
@@ -178,40 +194,65 @@ def image_generate():
    payload=json.dumps({'model':model,'prompt':prompt,'size':'1024x1024','n':1}).encode()
    req=urllib.request.Request('https://api.openai.com/v1/images/generations',data=payload,headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'},method='POST')
   else:
-   boundary='growboss-'+uuid.uuid4().hex
-   chunks=[]
-   for name,value in [('model',model),('prompt',prompt),('size','1024x1024')]:
-    chunks.append(('--'+boundary+'\r\nContent-Disposition: form-data; name="'+name+'"\r\n\r\n'+value+'\r\n').encode())
+   boundary='growboss-'+uuid.uuid4().hex;chunks=[]
+   for name,value in [('model',model),('prompt',prompt),('size','1024x1024')]:chunks.append(('--'+boundary+'\r\nContent-Disposition: form-data; name="'+name+'"\r\n\r\n'+value+'\r\n').encode())
    chunks.append(('--'+boundary+'\r\nContent-Disposition: form-data; name="image"; filename="upload"\r\nContent-Type: '+mime+'\r\n\r\n').encode()+raw+b'\r\n')
    chunks.append(('--'+boundary+'--\r\n').encode())
    req=urllib.request.Request('https://api.openai.com/v1/images/edits',data=b''.join(chunks),headers={'Authorization':'Bearer '+key,'Content-Type':'multipart/form-data; boundary='+boundary},method='POST')
-  with urllib.request.urlopen(req,timeout=180) as resp: result=json.load(resp)
+  with urllib.request.urlopen(req,timeout=180) as resp:result=json.load(resp)
   item=result['data'][0]
   if item.get('b64_json'):return jsonify(image='data:image/png;base64,'+item['b64_json'])
   return jsonify(error='Image API returned an unexpected response.'),502
  except urllib.error.HTTPError as e:
   try:detail=json.loads(e.read(4000)).get('error',{}).get('message','')
   except Exception:detail=''
-  app.logger.warning('Image API error: %s %s',e.code,detail[:250])
-  return jsonify(error='Image generation failed. Check your image model access and API billing.'),502
+  app.logger.warning('Image API error: %s %s',e.code,detail[:250]);return jsonify(error='Image generation failed. Check your image model access and API billing.'),502
  except Exception:
-  app.logger.exception('Image generation failed')
-  return jsonify(error='Image generation is temporarily unavailable.'),502
+  app.logger.exception('Image generation failed');return jsonify(error='Image generation is temporarily unavailable.'),502
+
+# Stripe plan recognition is based on the subscription's actual Stripe price, never a client claim.
+def price_plan(price):
+ if price and price==os.environ.get('STRIPE_PRO_PLUS_PRICE_ID'):return 'pro_plus'
+ if price and price==os.environ.get('STRIPE_PRICE_ID'):return 'pro'
+ return None
+
+def subscription_details(sub):
+ items=sub.get('items',{}).get('data',[])
+ if len(items)!=1:return None
+ price=items[0].get('price') or {}
+ pid=price if isinstance(price,str) else price.get('id')
+ return price_plan(pid)
+
+def update_from_subscription(sub):
+ status=sub.get('status','incomplete');customer=sub.get('customer');customer=customer.get('id') if isinstance(customer,dict) else customer
+ plan=subscription_details(sub)
+ if not customer or not plan:
+  app.logger.warning('Unrecognized Stripe subscription price/customer; no plan update')
+  return
+ period=sub.get('current_period_end') or 0
+ with conn() as c:c.execute('UPDATE users SET subscription=?,plan=?,period_end=? WHERE stripe_customer=?',(status,plan,int(period),customer))
 
 @app.post('/api/billing/checkout')
 @require_auth
 def checkout():
  import stripe
- if not os.environ.get('STRIPE_SECRET_KEY') or not os.environ.get('STRIPE_PRICE_ID'):return jsonify(error='Stripe billing is not configured yet.'),503
+ if not os.environ.get('STRIPE_SECRET_KEY'):return jsonify(error='Stripe billing is not configured yet.'),503
+ d=request.get_json(silent=True) or {};requested=d.get('plan','pro')
+ if requested not in ('pro','pro_plus'):return jsonify(error='Invalid subscription plan.'),400
+ price=os.environ.get('STRIPE_PRO_PLUS_PRICE_ID' if requested=='pro_plus' else 'STRIPE_PRICE_ID')
+ if not price:return jsonify(error='Selected plan is not configured.'),503
  stripe.api_key=os.environ['STRIPE_SECRET_KEY'];u=user()
+ # Existing paid subscribers must use the billing portal rather than buy a second subscription.
+ if u['subscription'] in ACTIVE:return jsonify(error='You already have a paid subscription. Use Manage billing to change or cancel it.'),409
  base=os.environ.get('PUBLIC_BASE_URL',request.host_url.rstrip('/')).rstrip('/')
  try:
-  args=dict(mode='subscription',line_items=[{'price':os.environ['STRIPE_PRICE_ID'],'quantity':1}],success_url=base+'/?billing=success',cancel_url=base+'/?billing=cancel',client_reference_id=str(u['id']),metadata={'user_id':str(u['id'])})
+  args=dict(mode='subscription',line_items=[{'price':price,'quantity':1}],success_url=base+'/?billing=success',cancel_url=base+'/?billing=cancel',client_reference_id=str(u['id']),metadata={'user_id':str(u['id'])})
   if u['stripe_customer']:args['customer']=u['stripe_customer']
   else:args['customer_email']=u['email']
-  checkout_session=stripe.checkout.Session.create(**args)
-  return jsonify(url=checkout_session.url)
- except Exception:return jsonify(error='Could not create checkout session.'),502
+  s=stripe.checkout.Session.create(**args)
+  return jsonify(url=s.url)
+ except Exception:
+  app.logger.exception('Stripe checkout error');return jsonify(error='Could not create checkout session.'),502
 
 @app.post('/api/billing/portal')
 @require_auth
@@ -223,29 +264,44 @@ def portal():
  try:
   s=stripe.billing_portal.Session.create(customer=u['stripe_customer'],return_url=os.environ.get('PUBLIC_BASE_URL',request.host_url.rstrip('/')))
   return jsonify(url=s.url)
- except Exception:return jsonify(error='Billing portal is not configured.'),502
+ except Exception:
+  app.logger.exception('Stripe billing portal error');return jsonify(error='Billing portal is not configured. Check Stripe Customer Portal settings.'),502
 
 @app.post('/api/stripe/webhook')
 def webhook():
  import stripe
- stripe.api_key=os.environ.get('STRIPE_SECRET_KEY','')
- secret=os.environ.get('STRIPE_WEBHOOK_SECRET')
+ stripe.api_key=os.environ.get('STRIPE_SECRET_KEY','');secret=os.environ.get('STRIPE_WEBHOOK_SECRET')
  if not secret:return jsonify(error='Webhook secret missing'),503
  try:event=stripe.Webhook.construct_event(request.get_data(),request.headers.get('Stripe-Signature',''),secret)
  except Exception:return jsonify(error='Invalid signature'),400
  eid=event['id'];obj=event['data']['object'];typ=event['type']
  with conn() as c:
   if c.execute('SELECT 1 FROM webhook_events WHERE id=?',(eid,)).fetchone():return jsonify(ok=True)
-  if typ=='checkout.session.completed' and obj.get('mode')=='subscription':
-   uid=obj.get('client_reference_id') or (obj.get('metadata') or {}).get('user_id')
-   if uid and str(uid).isdigit():c.execute('UPDATE users SET stripe_customer=?,subscription=? WHERE id=?',(obj.get('customer'),'active',int(uid)))
-  elif typ in ('customer.subscription.updated','customer.subscription.deleted','customer.subscription.created'):
-   status=obj.get('status','canceled');customer=obj.get('customer');period=obj.get('current_period_end',0)
-   c.execute('UPDATE users SET subscription=?,period_end=? WHERE stripe_customer=?',(status,period,customer))
-  c.execute('INSERT INTO webhook_events(id) VALUES(?)',(eid,))
+ # For checkout, verify the subscription with Stripe before granting paid access.
+ if typ=='checkout.session.completed' and obj.get('mode')=='subscription':
+  uid=obj.get('client_reference_id') or (obj.get('metadata') or {}).get('user_id')
+  sid=obj.get('subscription');customer=obj.get('customer')
+  if uid and str(uid).isdigit() and sid and customer:
+   try:
+    sub=stripe.Subscription.retrieve(sid)
+    if sub.get('customer')==customer and sub.get('status') in ACTIVE:
+     plan=subscription_details(sub)
+     if plan:
+      with conn() as c:c.execute('UPDATE users SET stripe_customer=?,subscription=?,plan=?,period_end=? WHERE id=?',(customer,sub['status'],plan,int(sub.get('current_period_end') or 0),int(uid)))
+   except Exception:
+    app.logger.exception('Could not verify checkout subscription');return jsonify(error='Temporary Stripe error'),503
+ elif typ in ('customer.subscription.updated','customer.subscription.deleted','customer.subscription.created'):
+  # Retrieve current state to avoid stale events overwriting newer status.
+  try:
+   sub=stripe.Subscription.retrieve(obj['id'])
+  except stripe.error.InvalidRequestError:
+   sub=obj # Stripe may no longer return a deleted subscription.
+  except Exception:
+   app.logger.exception('Could not retrieve subscription');return jsonify(error='Temporary Stripe error'),503
+  update_from_subscription(sub)
+ with conn() as c:c.execute('INSERT INTO webhook_events(id) VALUES(?) ON CONFLICT(id) DO NOTHING',(eid,))
  return jsonify(ok=True)
 
 @app.get('/health')
 def health():return jsonify(status='ok')
-
-if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.environ.get('PORT','8000')),debug=False)
+if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.environ.get('PORT','80
