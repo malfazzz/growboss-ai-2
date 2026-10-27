@@ -92,6 +92,10 @@ def security():
 @app.get('/')
 def home():return send_from_directory(ROOT,'index.html')
 
+@app.get('/download.png')
+def logo_image():
+    return send_from_directory(ROOT, 'download.png')
+
 @app.post('/api/auth/register')
 def register():
  d=request.get_json(silent=True) or {};email=str(d.get('email','')).strip().lower();pw=str(d.get('password',''))
